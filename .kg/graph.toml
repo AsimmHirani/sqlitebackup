@@ -1,0 +1,356 @@
+schema_version = 1
+
+[nodes.aad-bound-to-name]
+kind = "Decision"
+title = "AAD bound to full project prefix (name-metadata), not just name"
+body = """
+Use deaddrop-crypto's `encrypt_chunk(drop_uuid, chunk_index, bytes)` with `drop_uuid = "{name}-{metadata}"` and `chunk_index = 0`. AAD = `b"deaddrop:chunk:{name}-{metadata}:0"`.
+
+(Slug is historical — originally just `name`; widened to the full prefix when `metadata` was introduced. See [[identity-name-and-metadata]].)
+
+**Why:** Binds the ciphertext to the *full* project identity, not just the logical service name. A backup blob for `api-prod-web01` literally cannot be decrypted as `api-staging-web01` even if dropped into the wrong S3 prefix or fed to the wrong restore invocation — the AAD mismatch fails the AES-GCM tag check. Without this widening, two projects sharing a `name` but differing in `metadata` would have interchangeable ciphertext.
+
+**How to apply:** Any future encrypt/decrypt path MUST pass the full `project_prefix(cfg)` string, not `cfg.name`. If we ever add a `--force-name` style override that lets you decrypt across identity boundaries, do it by allowing the operator to pass an explicit AAD string — don't loosen the default. Don't switch to `encrypt_metadata` "to simplify" — you'd lose the binding entirely (it uses a static AAD).
+"""
+created_at = 1779946345
+updated_at = 1780031340
+
+[[nodes.aad-bound-to-name.anchors]]
+path = "src/main.rs"
+symbol = "main"
+
+[nodes.bundled-tar-payload]
+kind = "Decision"
+title = "Single .tar.gz.enc per backup (bundles dump.sql + backup.toml); --force preserves passphrase check"
+body = """
+Each backup is one S3 object: a tar of two entries (`backup.toml`, `dump.sql`), gzipped + AES-GCM encrypted under AAD=prefix, wrapped in the ISBK1 envelope. Restore decrypts + untars; `--config-out PATH` writes the recovered backup.toml. `list` reads only S3 metadata — never decrypts.
+
+Replaces the prior two-object layout (`{ts}.sql.gz.enc` data + `_config-{ts}.toml` plaintext sidecar). Three things change:
+
+1. *Sidecar confidentiality.* The toml carried `db_path` (and any future fields) — readable by anyone with bucket-read access. Bundling moves it behind the AEAD boundary; the only metadata still visible from S3 alone is the prefix `{name}-{metadata}` and the backup timestamps.
+2. *Half the object count.* One PutObject per backup instead of two. Half the Object Lock entries, half the lifecycle deletes, half the API calls.
+3. *--force preserves passphrase agreement.* The identity check now requires decrypting the latest existing blob with the current passphrase. `--force` skips the *identity tuple comparison* but the decryption still runs. If the prefix's previous backups were encrypted under a different passphrase, the AEAD tag fails and `--force` refuses. This is the explicit semantic the user asked for: "if --force is issued, also force the same password."
+
+**Why:**
+- A bucket reader without the passphrase shouldn't learn what database is being backed up. The prefix leaks `name + metadata` (operator-chosen, intentionally human-meaningful), but `db_path` is a real path on the operator's infrastructure and should be confidential.
+- Halving object count compounds across N projects + M months of retention — meaningfully cuts bucket inventory and per-request costs.
+- The "force same passphrase" property comes for free once the identity check requires decryption; no separate enforcement code.
+
+**How to apply:**
+- Bundle entries are `backup.toml` and `dump.sql` (literal names). Unbundle ignores other entries for forward-compat — if you add a third entry (signed digest? compressed sql?), don't break that contract.
+- The tar entry order is `backup.toml` first, `dump.sql` second. This is intentional: a future optimization could partial-decrypt the gunzipped tar to extract only the toml for `list` summarization. AES-GCM doesn't support partial decryption today, but if the bundle ever ungets the tag from the body (i.e. we move to a streaming AEAD), the ordering matters.
+- `--force` skips identity compare but NOT passphrase check. If you ever add `--force-passphrase` (override even decryption failure), gate it behind a louder confirmation — it would let an operator overwrite a prefix whose history they cannot read, leaving a permanently-broken timeline.
+- Backups are sized by the full bundle (a few hundred bytes for the toml + the SQL dump). Don't gzip the toml separately and bundle the .toml.gz — gzip a tar of plaintext beats two-pass gzipping each entry, and keeps the tar inspectable with `tar tvf` after manual decrypt.
+"""
+created_at = 1780035398
+updated_at = 1780035398
+
+[[nodes.bundled-tar-payload.anchors]]
+path = "src/main.rs"
+symbol = "bundle_tar"
+
+[[nodes.bundled-tar-payload.anchors]]
+path = "src/main.rs"
+symbol = "check_identity"
+
+[[nodes.bundled-tar-payload.anchors]]
+path = "src/main.rs"
+symbol = "unbundle_tar"
+
+[nodes.identity-name-and-metadata]
+kind = "Decision"
+title = "Project identity = (name, metadata) human suffix; toml bundled inside the backup blob"
+body = """
+Identity is the tuple `(name, metadata)`. The S3 prefix is `{name}-{metadata}`; `metadata` is a human-meaningful disambiguator the operator chooses by convention `{service}-{env}-{host}`. The local `backup.toml` is bundled inside every encrypted backup blob ([[bundled-tar-payload]]) so it can be recovered via `restore --config-out`.
+
+**Why:** Three real problems surfaced after the first live R2 test:
+
+1. *Name collisions.* A single `name` field across multiple enrolled projects is one typo away from two projects clobbering each other in the bucket. UUIDs solve uniqueness but become unrecoverable opaque tokens if the local `backup.toml` is lost.
+2. *Disaster recovery from `backup.toml` loss.* The local TOML carries identity + bucket info; without it, the operator has to manually reconstruct everything from memory. Bundling the toml inside the encrypted blob reduces the recovery-required info to: bucket + R2 account + passphrase.
+3. *Discoverability.* Operators looking at the bucket should be able to tell what's there. The prefix is observable (S3 keys can't be encrypted), so `list` works without decryption — db_path / future toml fields stay confidential behind the AEAD boundary.
+
+**How to apply:** `metadata` is required in any new backup.toml — don't ship a fallback that uses just `name`. Uniqueness is operator discipline, not tool-enforced — but the soft-check ([[bundled-tar-payload]] for the decrypt-then-compare semantics) catches accidental collisions at first PutObject, not after data has been written. The prefix encodes name + metadata in plaintext on purpose; if your threat model needs prefix opacity, you'd need to switch to UUIDs and lose disaster recoverability.
+"""
+created_at = 1780031351
+updated_at = 1780035365
+
+[[nodes.identity-name-and-metadata.anchors]]
+path = "src/main.rs"
+symbol = "check_sidecar"
+
+[[nodes.identity-name-and-metadata.anchors]]
+path = "src/main.rs"
+symbol = "project_prefix"
+
+[nodes.in-memory-only]
+kind = "Gotcha"
+title = "Whole dump + gzip + ciphertext buffered in RAM"
+body = """
+The pipeline buffers the entire compressed SQL dump as a `Vec<u8>` before encrypting, then buffers the entire envelope before PutObject. Peak memory ≈ 2× compressed dump size.
+
+**Why:** Good enough for small operational DBs (single-digit MB compressed). Avoids the complexity of streaming AEAD (multi-chunk with monotonic indices) and S3 multipart upload.
+
+**How to apply:** If you enroll a new project whose `.dump` output is hundreds of MB compressed, this becomes a real constraint. The refactor: switch to multi-chunk `encrypt_chunk(name, i, ...)` for i=0..N, ship them as parts of an S3 multipart upload, and bump the envelope version. Do NOT silently switch to streaming with the same envelope version — restore tools relying on v1 will break.
+"""
+created_at = 1779946359
+updated_at = 1779946359
+
+[[nodes.in-memory-only.anchors]]
+path = "src/main.rs"
+symbol = "dump_and_compress"
+
+[nodes.isbk1-envelope]
+kind = "Decision"
+title = "ISBK1 envelope wraps ciphertext with salt + Argon2 params"
+body = """
+On-disk format is a custom binary envelope; the deaddrop-crypto ciphertext alone is not self-describing enough to decrypt later.
+
+Layout (all multi-byte LE):
+  [4]  magic "ISBK"
+  [1]  version (=1)
+  [1]  salt_len (=16)
+  [16] salt
+  [4]  argon2 m_cost
+  [4]  argon2 t_cost
+  [4]  argon2 p_cost
+  [..] deaddrop-crypto ciphertext (nonce(12) | cipher | tag(16))
+
+**Why:** deaddrop-crypto's ciphertext layout (nonce|ct|tag) doesn't carry the Argon2 salt or cost params — its original calling context kept them in a server-side DB row. For a standalone backup file we have to ship them inline so the restore tool can derive the same key. Version byte lets us evolve (e.g. switch to chunked encryption for huge DBs) without ambiguity.
+
+**How to apply:** Restore tool MUST validate magic + version before parsing. Bumping the version means restore must support both old and new for as long as historical backups need to be recoverable. Don't pull fields out of the envelope (e.g. "salt is always at offset N") — go through a parser.
+"""
+created_at = 1779946353
+updated_at = 1779946353
+
+[[nodes.isbk1-envelope.anchors]]
+path = "src/main.rs"
+symbol = "pack_envelope"
+
+[nodes.object-lock-compat]
+kind = "Decision"
+title = "Object Lock compat: never overwrite, ms-precision timestamps, one bundled blob per backup"
+body = """
+The bucket has two operator-set rules:
+- *Object Lock retention:* uploaded objects are immutable for 90 days (no overwrite, no delete).
+- *Lifecycle:* objects older than 120 days are deleted.
+
+The pipeline is designed so every backup writes a *fresh* key, never an overwrite. Each backup is a single object at `{prefix}/{ISO-8601 UTC, ms precision}.tar.gz.enc`. The earlier two-object design (separate `_config.toml` sidecar) was retired ([[bundled-tar-payload]]) — partly because every config re-upload would have hit the lock on subsequent backups, partly because the plaintext sidecar leaked metadata.
+
+**Why:**
+- Millisecond precision in the timestamp keeps lex order intact (`.000Z < .500Z` within a second, integer-second field dominates across seconds) while making same-second collisions essentially impossible (a backup takes ~hundreds of ms of Argon2 derive alone, so two backups will be well over 1ms apart in practice).
+- Lex-sort on ISO-8601 keys is the same trick we already use for picking the latest backup ([[restore-latest-by-lex-sort]]); zero new infra.
+- A project that hasn't been backed up in >120d disappears from the bucket entirely (all its blobs lifecycled out). That's correct behavior: a stale backup graveyard is worse than no entry, and the retention contract is "120 days of history."
+
+**How to apply:**
+- Never PutObject to an existing key. If we ever need to update something (e.g. mark a backup verified), use a fresh `{ts}` not the original.
+- The 90d Object Lock prevents `delete-and-replace` recovery from a corrupt blob within its retention window — there is no "rewrite this entry" escape hatch. If a malformed blob is uploaded, the only fix is to wait it out (or take a new backup, which writes a fresh blob that becomes the latest).
+- Same-second collision protection is statistical, not absolute. If you ever need bulk-parallel backups against the same prefix, switch to nanosecond precision (`%.9f`) or append a random suffix.
+- Stray non-`.tar.gz.enc` files from older code versions are orphans — `latest_backup_key`'s filter ignores them; they sit until lifecycle takes them in <=120d. Don't write a migration that tries to delete them — the 90d lock probably still blocks.
+"""
+created_at = 1780032502
+updated_at = 1780035377
+
+[[nodes.object-lock-compat.anchors]]
+path = "src/main.rs"
+symbol = "latest_sidecar_key"
+
+[[nodes.object-lock-compat.anchors]]
+path = "src/main.rs"
+symbol = "sidecar_key"
+
+[nodes.pipeline]
+kind = "Component"
+title = "Backup + restore + list pipelines (single bundled object per backup)"
+body = """
+Single binary, three subcommands (plus a `backup --install-systemd <INTERVAL>` install path that writes a systemd timer instead of running a backup — see [[systemd-install-shape]]). Each backup is ONE encrypted S3 object — see [[bundled-tar-payload]].
+
+Project identity is the tuple `(name, metadata, db_path)`; the S3 prefix is `{name}-{metadata}`. See [[identity-name-and-metadata]] for the human-suffix design; the toml is no longer in a separate plaintext sidecar — it's bundled inside the encrypted backup blob.
+
+## `sqlitebackup backup [--force]`
+
+1. Compute prefix from (name, metadata).
+2. Identity check: list_objects in the prefix, find the lex-greatest `.tar.gz.enc`. If empty → first backup, proceed. If present → fetch + decrypt with current passphrase + AAD=prefix; if decrypt fails (wrong passphrase, AAD mismatch, corrupt blob) → refuse, even with `--force`. With `--force`: stop after successful decrypt (passphrase verified). Without `--force`: untar, parse the embedded backup.toml, compare identity tuple; refuse on mismatch.
+3. Spawn `sqlite3 <db_path> .dump`, read stdout to bytes (no streaming through gzip in the new layout — bundling needs the SQL as a discrete tar entry).
+4. tar = {`backup.toml` entry + `dump.sql` entry}; gzip the tar.
+5. random_bytes(16) for Argon2id salt; PasswordKey::derive with deaddrop-crypto defaults.
+6. encrypt_chunk(&prefix, 0, &gz) — AAD binds the bundle to the full prefix ([[aad-bound-to-name]]).
+7. Pack ISBK1 envelope ([[isbk1-envelope]]).
+8. PutObject at `{prefix}/{ISO-8601 UTC, ms precision}.tar.gz.enc`. Millisecond precision prevents same-second collision into an Object-Lock-locked key ([[object-lock-compat]]).
+
+## `sqlitebackup restore [--key K] [--output PATH] [--config-out PATH]`
+
+1. Compute prefix. Resolve S3 key: explicit `--key`, or list_objects_v2(prefix="{prefix}/") and pick the lex-greatest `.tar.gz.enc` ([[restore-latest-by-lex-sort]]).
+2. GetObject → parse envelope → derive Argon2id key with *stored* params (so backups taken under older params still open) → decrypt_chunk → gunzip → untar.
+3. Write `dump.sql` to `--output` (default `-` = stdout, pipe into `sqlite3 newdb.db`).
+4. If `--config-out PATH` set: also write the recovered `backup.toml`. Disaster recovery: `restore -o foo.sql --config-out backup.toml.recovered`.
+
+## `sqlitebackup list`
+
+1. list_objects_v2 with delimiter='/' to enumerate top-level common prefixes.
+2. For each prefix, count `.tar.gz.enc` siblings + find lex-greatest timestamp.
+3. Print `prefix / backups: N (latest TS)`. **No decryption, no passphrase required** — only what S3 metadata reveals. The prefix already encodes name + metadata in plaintext (unavoidable; S3 keys are not encrypted), so list is essentially "what's in the bucket" without unlocking. Operators needing the encrypted-only fields (db_path, future toml fields) get them via `restore --config-out`.
+
+Whole pipeline buffers in RAM at every step ([[in-memory-only]]).
+"""
+created_at = 1779946335
+updated_at = 1780035355
+
+[[nodes.pipeline.anchors]]
+path = "src/main.rs"
+symbol = "main"
+
+[[nodes.pipeline.anchors]]
+path = "src/main.rs"
+symbol = "run_restore"
+
+[nodes.r2-wrong-token-type]
+kind = "Gotcha"
+title = "R2 401: generic Cloudflare API token used in place of R2 S3 token"
+body = """
+The Cloudflare dashboard exposes two unrelated credential types that both look like "API tokens" but only one works at the S3-compatible R2 endpoint:
+
+- **R2 S3 token** — created at *R2 → Manage R2 API Tokens → Create API Token*. Produces an **Access Key ID** (32-char hex) + **Secret Access Key** (64-char lowercase hex, it's a SHA-256). This is the only credential that authenticates against `<account>.r2.cloudflarestorage.com`.
+- **Generic Cloudflare API token** — created at *My Profile → API Tokens*. A single 40–53-char string (often starts with `cfat...`). Authenticates against `api.cloudflare.com/...` only.
+
+**Why:** Symptom is `401 Unauthorized` (code: `Unauthorized`) on every operation — list-buckets, put-object, get-object alike. aws-sdk-s3 surfaces it as `unhandled error (Unauthorized)` with no hint. `curl --aws-sigv4` signs the request happily (the sigv4 maths don't care that the secret isn't the right *kind* of secret) and R2 still returns 401. Easy to misdiagnose as a bucket-permission or SDK-checksum issue.
+
+**How to apply:** First triage step on any R2 401 is to check `wc -c` on the secret. 64 chars lowercase hex → right token type, look at bucket scoping next. Any other length / non-hex chars → wrong token type, regenerate via the R2-specific page. Don't trust the dashboard UI labels — both flows say "API Token".
+"""
+created_at = 1780029883
+updated_at = 1780029883
+
+[[nodes.r2-wrong-token-type.anchors]]
+path = "example-backup.toml"
+
+[[nodes.r2-wrong-token-type.anchors]]
+path = "src/main.rs"
+symbol = "build_s3_client"
+
+[nodes.restore-latest-by-lex-sort]
+kind = "Decision"
+title = "Restore default = lex-greatest object under {name}/"
+body = """
+When `restore` is invoked without `--key`, list objects under prefix `{name}/`, filter to `*.sql.gz.enc`, and pick the lex-greatest key.
+
+**Why:** Backup keys are `{prefix}/{ISO-8601 UTC, ms precision}.tar.gz.enc` (see [[bundled-tar-payload]]). ISO-8601 timestamps sort correctly *lexically* (`2026-05-28T...` > `2026-05-27T...`), so `max()` over the string keys yields the newest backup — no need to inspect LastModified, parse timestamps, or fetch HEAD metadata for each object. Listing is one round-trip; sorting is in-memory.
+
+**How to apply:** If you ever change the backup key format (e.g. add a hostname prefix, switch to epoch ms), reconfirm lex-sort still yields chronological order. If it doesn't, fall back to LastModified or parse the timestamp out of the key explicitly. Don't trust the order returned by S3 — it's documented as undefined.
+"""
+created_at = 1779985620
+updated_at = 1780035400
+
+[[nodes.restore-latest-by-lex-sort.anchors]]
+path = "src/main.rs"
+symbol = "latest_object_key"
+
+[nodes.systemd-install-shape]
+kind = "Decision"
+title = "systemd timer install: sh -c wrapper for .env, OnUnitActiveSec, /etc/systemd/system"
+body = """
+`sqlitebackup backup --install-systemd <INTERVAL>` writes two units to `/etc/systemd/system/`:
+- `sqlitebackup-{prefix}.service` (Type=oneshot, runs the backup once)
+- `sqlitebackup-{prefix}.timer` (OnBootSec=15min, OnUnitActiveSec={INTERVAL}, Persistent=true)
+
+ExecStart uses a `/bin/sh -c '...'` wrapper rather than systemd's native `EnvironmentFile=`.
+
+**Why:**
+1. *sh wrapper over EnvironmentFile=.* `EnvironmentFile=` only accepts bare `KEY=VALUE` lines — it rejects/silently-misparses the `export KEY=VALUE` form most operators use in `.env` files (because the same file gets manually `source`'d during ad-hoc invocations). One file, two consumers, no maintenance drift.
+2. *System units over user units.* The tool typically backs up root-owned DBs (e.g. `/var/lib/myapp/database.db`). Running as user would require either making the DB world-readable or duplicating ownership. System mode keeps the security boundary at root.
+3. *OnUnitActiveSec + OnBootSec + Persistent.* `OnUnitActiveSec` is interval-from-last-run (predictable cadence). `OnBootSec=15min` avoids hammering on cold boot. `Persistent=true` runs a missed backup on next boot if the machine was off when the timer would have fired.
+4. *Prints units before writing.* The full content of both files goes to stderr before the write attempt, so an operator hitting `Permission denied` (i.e. forgot `sudo`) already has the content they'd need to install manually.
+
+**How to apply:** Use the same shell wrapper if you ever add a peer command (e.g. a periodic verify/prune). If you switch to `EnvironmentFile=`, you'll need a `.env.systemd` companion file and a way to keep it in sync — don't do that silently. Interval validation is delegated to systemd at unit-load time (run `systemd-analyze timespan <INTERVAL>` to pre-check). Calendar-style schedules (e.g. `*-*-* 03:00:00`) are not supported by this flag — operators wanting them edit the generated `.timer` and replace `OnUnitActiveSec=` with `OnCalendar=`.
+"""
+created_at = 1780031840
+updated_at = 1780031840
+
+[[nodes.systemd-install-shape.anchors]]
+path = "src/main.rs"
+symbol = "install_systemd_units"
+
+[[edges]]
+from = "bundled-tar-payload"
+to = "aad-bound-to-name"
+kind = "see_also"
+note = "AAD now covers both sql and toml"
+
+[[edges]]
+from = "bundled-tar-payload"
+to = "identity-name-and-metadata"
+kind = "see_also"
+note = "replaces the plaintext sidecar"
+
+[[edges]]
+from = "bundled-tar-payload"
+to = "object-lock-compat"
+kind = "see_also"
+note = "halves the object writes"
+
+[[edges]]
+from = "identity-name-and-metadata"
+to = "aad-bound-to-name"
+kind = "see_also"
+note = "widened the AAD binding"
+
+[[edges]]
+from = "in-memory-only"
+to = "pipeline"
+kind = "gotcha_in"
+
+[[edges]]
+from = "isbk1-envelope"
+to = "aad-bound-to-name"
+kind = "see_also"
+note = "constrains the same ciphertext at different layers"
+
+[[edges]]
+from = "object-lock-compat"
+to = "identity-name-and-metadata"
+kind = "see_also"
+note = "lifted from the original sidecar design"
+
+[[edges]]
+from = "object-lock-compat"
+to = "restore-latest-by-lex-sort"
+kind = "see_also"
+note = "same lex-sort trick on sidecars"
+
+[[edges]]
+from = "pipeline"
+to = "aad-bound-to-name"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "bundled-tar-payload"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "identity-name-and-metadata"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "isbk1-envelope"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "object-lock-compat"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "restore-latest-by-lex-sort"
+kind = "implements"
+
+[[edges]]
+from = "pipeline"
+to = "systemd-install-shape"
+kind = "implements"
+
+[[edges]]
+from = "r2-wrong-token-type"
+to = "pipeline"
+kind = "gotcha_in"
