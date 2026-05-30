@@ -1,0 +1,97 @@
+# sqlitebackup — per-project config.
+#
+# Drop a copy of this file at the project root as `backup.toml` and edit the
+# TODOs. Credentials are NEVER read from this file; see the .env section below.
+#
+# Invoked as:
+#
+#     sqlitebackup backup                            # uses ./backup.toml
+#     sqlitebackup restore                           # latest backup, SQL → stdout
+#     sqlitebackup restore -o restored.sql           # write SQL to a file
+#     sqlitebackup list                              # show all enrolled projects
+#     sqlitebackup --config /path/backup.toml backup
+#
+# Per backup the tool will:
+#   1. Run `sqlite3 <db_path> .dump`
+#   2. tar { backup.toml + dump.sql } → gzip → encrypt
+#      (Argon2id + AES-256-GCM, AAD-bound to <name>-<metadata>)
+#   3. PutObject ONE object to s3://<bucket>/<name>-<metadata>/<ISO ts, ms>.tar.gz.enc
+#   4. Before doing any of that, fetch the existing latest blob in the prefix
+#      and decrypt it with your current passphrase. If decryption fails (wrong
+#      passphrase, foreign blob), the backup refuses — even with `--force`.
+#      `--force` only skips the identity-tuple comparison; same-passphrase is
+#      always enforced on every backup to a given prefix.
+#
+# Disaster recovery from "lost the local toml" needs only bucket + creds + passphrase:
+#   sqlitebackup list                              # see what's in the bucket
+#   sqlitebackup restore --config-out recovered.toml -o restored.sql
+#   # → recovered.toml is the backup.toml at time-of-backup; restored.sql is the DB
+
+# ---------------------------------------------------------------------------
+# Project identity
+# ---------------------------------------------------------------------------
+
+# Logical service name. Short, semantic — e.g. "database", "sessions", "ledger".
+name = "database"  # TODO
+
+# Disambiguator the operator chooses so multiple projects can share `name`
+# without colliding. Convention: {service}-{env}-{host} — that triple is
+# memorable enough to reconstruct after a disaster ("the API DB, prod, on
+# host web-01") and unique enough across a real fleet.
+#
+# Together {name}-{metadata} forms:
+#   - the S3 key prefix:  <name>-<metadata>/<timestamp>.tar.gz.enc
+#   - the AAD binding for the encrypted blob, so a backup file for one project
+#     literally cannot be decrypted as another.
+#
+# Before each PutObject, sqlitebackup fetches the latest blob in the prefix
+# and decrypts it with your current passphrase; if decryption succeeds it
+# also compares your local (name, metadata, db_path) against the recovered
+# config and refuses on mismatch. Pass --force to skip *only* the identity
+# tuple compare (same passphrase is still required).
+metadata = "prod-web01"  # TODO
+
+# Path to the SQLite database file. Anything `sqlite3 <path> .dump` accepts.
+db_path = "/var/lib/myapp/database.db"  # TODO
+
+# ---------------------------------------------------------------------------
+# S3 / Cloudflare R2 destination
+# ---------------------------------------------------------------------------
+
+[s3]
+# Bucket the encrypted backups land in.
+bucket = "my-backups"  # TODO
+
+# Region. R2 ignores this but the SDK requires *something*; "auto" is the
+# canonical R2 value. Plain AWS S3 wants e.g. "us-east-1".
+region = "auto"
+
+# Custom endpoint. For R2 this is `https://<account-id>.r2.cloudflarestorage.com`.
+# Omit (comment out) for plain AWS S3.
+endpoint_url = "https://TODO-account-id.r2.cloudflarestorage.com"
+
+# Use path-style addressing (`endpoint/bucket/key`) instead of virtual-host
+# style. Default is false (virtual-host). Set to true only for MinIO-style
+# self-hosted S3 that requires it.
+force_path_style = false
+
+# ---------------------------------------------------------------------------
+# Environment (sourced before invoking sqlitebackup)
+# ---------------------------------------------------------------------------
+#
+# Place these in a .env file next to backup.toml, mode 0400, and source it
+# from your scheduler / wrapper script before invoking sqlitebackup:
+#
+#     SQLITEBACKUP_SECRET=<your backup passphrase>
+#     AWS_ACCESS_KEY_ID=<r2-or-aws-access-key-id>
+#     AWS_SECRET_ACCESS_KEY=<r2-or-aws-secret-access-key>
+#
+# SQLITEBACKUP_SECRET is the passphrase Argon2id consumes to derive the
+# encryption key. Lose it and historical backups become unrecoverable; rotate
+# it and you'll need a separate passphrase per-rotation to decrypt old files.
+#
+# When creating an R2 token in the Cloudflare dashboard, use the *R2-specific*
+# token page (R2 → Manage R2 API Tokens → Create API Token). The token there
+# produces a 32-hex Access Key ID + 64-hex Secret Access Key pair. Generic
+# Cloudflare API tokens (40–53 chars, often `cfat...`) sign requests cleanly
+# under sigv4 but R2 returns bare 401 Unauthorized.

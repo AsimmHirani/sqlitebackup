@@ -1,0 +1,29 @@
+[package]
+name = "sqlitebackup"
+version = "0.1.0"
+edition = "2024"
+description = "Dump, compress, encrypt, and upload a SQLite database to S3"
+publish = false
+
+[[bin]]
+name = "sqlitebackup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+deaddrop-crypto = "1"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+tar = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process"] }
+toml = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
