@@ -110,3 +110,7 @@ cargo test
 ```
 
 A `.kg/graph.toml` ships at the repo root with the architectural decisions and gotchas behind the current code (AAD widening, ISBK1 envelope rationale, Object Lock compatibility, the `--force` semantics, etc.) — useful background if you're modifying the pipeline.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
