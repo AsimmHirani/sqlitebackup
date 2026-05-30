@@ -1,3 +1,4 @@
 .kg/*
 !.kg/graph.toml
 *.env
+target/

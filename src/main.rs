@@ -62,7 +62,7 @@ use deaddrop_crypto::{
     ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, PasswordKey, random_bytes,
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command};
 use zeroize::Zeroizing;
 
@@ -126,7 +126,7 @@ enum Cmd {
     List,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct Config {
     #[serde(default)]
     name: Option<String>,
@@ -137,7 +137,7 @@ struct Config {
     s3: S3Config,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct S3Config {
     bucket: String,
     region: String,
@@ -675,7 +675,8 @@ fn load_config(path: &Path) -> Result<(Config, String)> {
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let cfg: Config =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok((cfg, text))
+    let text_no_comments = toml::to_string_pretty(&cfg).with_context(|| format!("clean_parse {}", path.display()))?;
+    Ok((cfg, text_no_comments))
 }
 
 fn load_passphrase() -> Result<Zeroizing<String>> {

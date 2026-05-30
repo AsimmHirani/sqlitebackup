@@ -1,6 +1,6 @@
 [package]
 name = "sqlitebackup"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Dump, compress, encrypt, and upload a SQLite database to S3"
 license = "MIT"
